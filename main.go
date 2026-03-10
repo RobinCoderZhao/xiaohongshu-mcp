@@ -13,11 +13,18 @@ func main() {
 		headless bool
 		binPath  string // 浏览器二进制文件路径
 		port     string
+		debugLog bool
 	)
 	flag.BoolVar(&headless, "headless", true, "是否无头模式")
 	flag.StringVar(&binPath, "bin", "", "浏览器二进制文件路径")
 	flag.StringVar(&port, "port", ":18060", "端口")
+	flag.BoolVar(&debugLog, "debug", false, "开启 debug 日志")
 	flag.Parse()
+
+	if debugLog {
+		logrus.SetLevel(logrus.DebugLevel)
+		logrus.Info("Debug logging enabled")
+	}
 
 	if len(binPath) == 0 {
 		binPath = os.Getenv("ROD_BROWSER_BIN")

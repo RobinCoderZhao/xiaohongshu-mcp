@@ -42,3 +42,13 @@ test_*.sh
 
 # Cookies files (contain sensitive login information)
 cookies.json
+
+# Browser profile data (sensitive, large)
+.browser-data/
+
+# Log files
+*.log
+mcp.log
+
+# Binary
+xiaohongshu-login

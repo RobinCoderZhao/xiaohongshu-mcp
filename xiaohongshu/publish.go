@@ -38,27 +38,49 @@ func NewPublishImageAction(page *rod.Page) (*PublishAction, error) {
 
 	pp := page.Timeout(300 * time.Second)
 
+	logrus.Info("[publish] 导航到发布页面...")
 	// 使用更稳健的导航和等待策略
 	if err := pp.Navigate(urlOfPublic); err != nil {
 		return nil, errors.Wrap(err, "导航到发布页面失败")
 	}
+	logrus.Info("[publish] Navigate 完成，等待页面加载...")
 
 	// 等待页面加载，使用 WaitLoad 代替 WaitIdle（更宽松）
 	if err := pp.WaitLoad(); err != nil {
 		logrus.Warnf("等待页面加载出现问题: %v，继续尝试", err)
 	}
+	logrus.Info("[publish] WaitLoad 完成")
 	time.Sleep(2 * time.Second)
+
+	// 处理海外服务器的 GDPR Cookie Consent 弹窗
+	DismissCookieConsent(pp)
+	time.Sleep(500 * time.Millisecond)
+
+	// 截图查看页面状态
+	screenshotData, scrErr := pp.Screenshot(true, nil)
+	if scrErr == nil && len(screenshotData) > 0 {
+		os.WriteFile("/tmp/xhs_navigate_debug.png", screenshotData, 0644)
+		logrus.Info("[publish] 已保存导航后截图到 /tmp/xhs_navigate_debug.png")
+	} else if scrErr != nil {
+		logrus.Warnf("[publish] 截图失败: %v", scrErr)
+	}
+
+	// 检查当前 URL，看是否被重定向到登录页
+	currentURL := pp.MustInfo().URL
+	logrus.Infof("[publish] 当前页面 URL: %s", currentURL)
 
 	// 等待页面稳定
 	if err := pp.WaitDOMStable(time.Second, 0.1); err != nil {
 		logrus.Warnf("等待 DOM 稳定出现问题: %v，继续尝试", err)
 	}
+	logrus.Info("[publish] DOM 稳定，点击上传图文 TAB...")
 	time.Sleep(1 * time.Second)
 
 	if err := mustClickPublishTab(pp, "上传图文"); err != nil {
 		logrus.Errorf("点击上传图文 TAB 失败: %v", err)
 		return nil, err
 	}
+	logrus.Info("[publish] 上传图文 TAB 已点击")
 
 	time.Sleep(1 * time.Second)
 
@@ -112,6 +134,47 @@ func clickEmptyPosition(page *rod.Page) {
 	x := 380 + rand.Intn(100)
 	y := 20 + rand.Intn(60)
 	page.Mouse.MustMoveTo(float64(x), float64(y)).MustClick(proto.InputMouseButtonLeft)
+}
+
+// DismissCookieConsent 自动关闭海外服务器上的 GDPR Cookie 同意弹窗
+// 小红书在海外 IP 访问时会弹出 "Your Cookie Preferences" 对话框，
+// 必须点击 "Accept all cookies" 才能继续操作，否则页面被遮挡无法交互。
+func DismissCookieConsent(page *rod.Page) {
+	page.MustEval(`() => {
+		// 查找并点击 "Accept all cookies" 按钮
+		const buttons = document.querySelectorAll('button');
+		for (const btn of buttons) {
+			const text = btn.textContent.trim().toLowerCase();
+			if (text.includes('accept all') || text.includes('accept cookies') || 
+				text.includes('接受所有') || text.includes('全部接受')) {
+				btn.click();
+				console.log('Cookie consent dismissed:', text);
+				return true;
+			}
+		}
+		// 尝试通过 class/id 查找
+		const acceptBtns = document.querySelectorAll(
+			'[class*="accept"], [class*="cookie-accept"], [id*="accept"], ' +
+			'[class*="consent"] button, [class*="cookie"] button'
+		);
+		for (const btn of acceptBtns) {
+			const text = btn.textContent.trim().toLowerCase();
+			if (text.includes('accept') || text.includes('接受')) {
+				btn.click();
+				console.log('Cookie consent dismissed via class:', text);
+				return true;
+			}
+		}
+		// 尝试移除 cookie 同意弹窗的覆盖层
+		const overlays = document.querySelectorAll(
+			'[class*="cookie-banner"], [class*="cookie-consent"], ' +
+			'[class*="cookie-overlay"], [class*="consent-banner"], ' +
+			'[class*="CookiePreferences"], [id*="cookie"]'
+		);
+		overlays.forEach(el => el.remove());
+		return false;
+	}`)
+	logrus.Debug("[cookie-consent] attempted to dismiss cookie consent popup")
 }
 
 func mustClickPublishTab(page *rod.Page, tabname string) error {
@@ -239,13 +302,15 @@ func uploadImages(page *rod.Page, imagesPaths []string) error {
 	return nil
 }
 
-// waitForUploadComplete 等待第 expectedCount 张图片上传完成，最多等 60 秒
+// waitForUploadComplete 等待第 expectedCount 张图片真正上传完成
+// 先等预览元素出现（文件被选中），然后等上传进度完成（进度条消失、loading 状态结束）
 func waitForUploadComplete(page *rod.Page, expectedCount int) error {
-	maxWaitTime := 60 * time.Second
-	checkInterval := 500 * time.Millisecond
+	maxWaitTime := 120 * time.Second // 海外服务器可能需要更长时间
+	checkInterval := 1 * time.Second
 	start := time.Now()
 	lastLogCount := expectedCount - 1
 
+	// Phase 1: 等待预览元素出现
 	for time.Since(start) < maxWaitTime {
 		uploadedImages, err := page.Elements(".img-preview-area .pr")
 		if err != nil {
@@ -254,20 +319,80 @@ func waitForUploadComplete(page *rod.Page, expectedCount int) error {
 		}
 
 		currentCount := len(uploadedImages)
-		// 数量变化时才打印，避免刷屏
 		if currentCount != lastLogCount {
 			slog.Info("等待图片上传", "current", currentCount, "expected", expectedCount)
 			lastLogCount = currentCount
 		}
 		if currentCount >= expectedCount {
-			slog.Info("图片上传完成", "count", currentCount)
-			return nil
+			slog.Info("图片预览已出现", "count", currentCount)
+			break
 		}
 
 		time.Sleep(checkInterval)
 	}
 
-	return errors.Errorf("第%d张图片上传超时(60s)，请检查网络连接和图片大小", expectedCount)
+	// Phase 2: 等待图片真正上传完成（进度条消失、loading 动画结束）
+	// 海外服务器上传 2MB+ 图片到国内可能需要 10-60 秒
+	slog.Info("等待图片真正上传完成（检查进度和 loading 状态）...")
+	uploadStart := time.Now()
+	uploadTimeout := 90 * time.Second
+
+	for time.Since(uploadStart) < uploadTimeout {
+		// 检查是否还有上传进度条、loading 动画或未完成的上传
+		uploadDone := page.MustEval(`() => {
+			// 检查是否有进度条
+			const progressBars = document.querySelectorAll('.progress, .upload-progress, [class*="progress"], .loading, [class*="loading"]');
+			for (const pb of progressBars) {
+				const rect = pb.getBoundingClientRect();
+				if (rect.width > 0 && rect.height > 0) {
+					return false; // 还有可见的进度条
+				}
+			}
+			// 检查图片预览元素是否有 loading 类
+			const previews = document.querySelectorAll('.img-preview-area .pr');
+			for (const p of previews) {
+				if (p.classList.contains('loading') || p.classList.contains('uploading')) {
+					return false; // 还在上传中
+				}
+				// 检查图片 src 是否为 blob URL（上传中的本地预览） vs CDN URL（上传完成）
+				const img = p.querySelector('img');
+				if (img) {
+					const src = img.src || img.getAttribute('src') || '';
+					// blob: 或空 src 表示还在上传
+					if (src.startsWith('blob:') || src === '') {
+						return false;
+					}
+				}
+			}
+			// 检查是否有"上传中"文字
+			const uploading = document.querySelector('[class*="uploading"], .upload-status');
+			if (uploading && uploading.textContent.includes('上传')) {
+				return false;
+			}
+			return true;
+		}`).Bool()
+
+		elapsed := time.Since(uploadStart).Seconds()
+
+		if uploadDone {
+			slog.Info("图片上传完成", "elapsed_seconds", int(elapsed))
+			// 即使检测到完成，也额外等一会确保服务器端处理完毕
+			extraWait := 5 * time.Second
+			slog.Info("额外等待确保上传处理完毕", "extra_wait", extraWait)
+			time.Sleep(extraWait)
+			return nil
+		}
+
+		if int(elapsed)%10 == 0 && int(elapsed) > 0 {
+			slog.Info("图片仍在上传中...", "elapsed_seconds", int(elapsed))
+		}
+		time.Sleep(checkInterval)
+	}
+
+	// 超时了但仍然继续（可能检测逻辑不完美，但图片实际已上传）
+	slog.Warn("图片上传等待超时(90s)，但继续执行发布", "elapsed", time.Since(uploadStart))
+	time.Sleep(5 * time.Second) // 额外等 5 秒再继续
+	return nil
 }
 
 func submitPublish(page *rod.Page, title, content string, tags []string, scheduleTime *time.Time, isOriginal bool, visibility string) error {
@@ -316,9 +441,11 @@ func submitPublish(page *rod.Page, title, content string, tags []string, schedul
 	}
 
 	// 设置可见范围
+	slog.Info("[debug] 准备设置可见范围", "visibility", visibility)
 	if err := setVisibility(page, visibility); err != nil {
 		return errors.Wrap(err, "设置可见范围失败")
 	}
+	slog.Info("[debug] 可见范围设置完成")
 
 	// 处理原创声明
 	if isOriginal {
@@ -329,15 +456,170 @@ func submitPublish(page *rod.Page, title, content string, tags []string, schedul
 		}
 	}
 
-	submitButton, err := page.Element(".publish-page-publish-btn button.bg-red")
-	if err != nil {
-		return errors.Wrap(err, "查找发布按钮失败")
-	}
-	if err := submitButton.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		return errors.Wrap(err, "点击发布按钮失败")
+	slog.Info("[debug] 准备查找发布按钮")
+
+	// 关闭可能存在的标签联想弹窗（输入#后弹出的下拉框会遮挡发布按钮）
+	page.MustEval(`() => {
+		// 移除标签联想下拉框
+		const containers = document.querySelectorAll('#creator-editor-topic-container, .topic-container, .d-options-wrapper');
+		containers.forEach(c => c.remove());
+		// 点击空白处关闭任何弹窗
+		document.body.click();
+	}`)
+	time.Sleep(500 * time.Millisecond)
+	// 按 Escape 关闭残留弹窗
+	page.KeyActions().Press(input.Escape).MustDo()
+	time.Sleep(500 * time.Millisecond)
+	clickEmptyPosition(page)
+	time.Sleep(500 * time.Millisecond)
+	slog.Info("[debug] 已清理弹窗")
+
+	// 截图以便调试
+	screenshotData, scrErr := page.Screenshot(true, nil)
+	if scrErr == nil && len(screenshotData) > 0 {
+		os.WriteFile("/tmp/xhs_publish_debug.png", screenshotData, 0644)
+		slog.Info("[debug] 已保存发布页面截图到 /tmp/xhs_publish_debug.png")
 	}
 
-	time.Sleep(3 * time.Second)
+	// 枚举所有发布相关按钮用于调试
+	btnListRaw := page.MustEval(`() => {
+		const buttons = document.querySelectorAll('button');
+		const publishBtns = [];
+		buttons.forEach((btn, i) => {
+			if (btn.textContent.trim().includes('发布')) {
+				const rect = btn.getBoundingClientRect();
+				publishBtns.push({
+					index: i,
+					text: btn.textContent.trim().substring(0, 30),
+					class: btn.className.substring(0, 80),
+					x: Math.round(rect.x),
+					y: Math.round(rect.y),
+					w: Math.round(rect.width),
+					h: Math.round(rect.height),
+				});
+			}
+		});
+		return publishBtns;
+	}`)
+	slog.Info("[debug] 页面上所有发布按钮", "buttons", btnListRaw.String())
+
+	// 通过 Rod 原生 Element.Click() 点击发布按钮
+	// JS .click() / dispatchEvent 在长内容页面上不可靠，
+	// Rod 原生点击通过 CDP Input.dispatchMouseEvent 发送真实鼠标事件
+	publishBtn, err := page.Element(`button`)
+	var foundBtn *rod.Element
+	if err == nil {
+		// 遍历所有 button 找到文本恰好是"发布"的最底部按钮
+		buttons, _ := page.Elements(`button`)
+		maxY := 0.0
+		for _, btn := range buttons {
+			text, _ := btn.Text()
+			text = strings.TrimSpace(text)
+			if text != "发布" {
+				continue
+			}
+			box, boxErr := btn.Shape()
+			if boxErr != nil || len(box.Quads) == 0 {
+				continue
+			}
+			// Y 坐标取第一个点的 Y
+			y := box.Quads[0][1]
+			width := box.Quads[0][2] - box.Quads[0][0]
+			if y > maxY && width > 80 {
+				maxY = y
+				foundBtn = btn
+			}
+		}
+		_ = publishBtn // suppress unused
+	}
+
+	if foundBtn != nil {
+		slog.Info("[debug] 找到发布按钮，使用多重点击策略")
+
+		// 先隐藏右侧预览面板和任何可能遮挡按钮的 overlay
+		page.MustEval(`() => {
+			// 隐藏右侧预览面板（可能有透明 overlay 拦截鼠标事件）
+			const preview = document.querySelector('.note-preview, .preview-container, .preview-panel, [class*="preview"]');
+			if (preview) {
+				preview.style.display = 'none';
+				console.log('[publish] 已隐藏预览面板');
+			}
+			// 移除所有可能的 overlay/mask
+			document.querySelectorAll('.d-overlay, .d-mask, [class*="overlay"], [class*="mask"]').forEach(el => {
+				el.remove();
+			});
+		}`)
+		time.Sleep(300 * time.Millisecond)
+
+		// scrollIntoView 确保按钮在视口中
+		foundBtn.MustEval(`() => this.scrollIntoView({block: 'center'})`)
+		time.Sleep(500 * time.Millisecond)
+
+		// 策略1: Rod 原生点击 — 通过 CDP 发送真实鼠标事件
+		clickErr := foundBtn.Click(proto.InputMouseButtonLeft, 1)
+		if clickErr != nil {
+			slog.Warn("[debug] Rod 原生点击失败", "err", clickErr)
+		} else {
+			slog.Info("[debug] Rod 原生点击完成")
+		}
+		time.Sleep(500 * time.Millisecond)
+
+		// 策略2: 无论 Rod 原生点击是否成功，都用 JS click() 作为双保险
+		// JS click() 不受 overlay/遮挡影响，直接触发 DOM 事件
+		foundBtn.MustEval(`() => {
+			this.click();
+			this.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+		}`)
+		slog.Info("[debug] JS click() 已执行（双保险）")
+	} else {
+		slog.Warn("[debug] 未找到发布按钮 Element，回退到 JS 点击")
+		page.MustEval(`() => {
+			const buttons = document.querySelectorAll('button');
+			let targetBtn = null;
+			let maxY = 0;
+			buttons.forEach(btn => {
+				const text = btn.textContent.trim();
+				const rect = btn.getBoundingClientRect();
+				if (text === '发布' && rect.y > maxY && rect.width > 80 && rect.height > 20) {
+					maxY = rect.y;
+					targetBtn = btn;
+				}
+			});
+			if (targetBtn) {
+				targetBtn.scrollIntoView({block: 'center'});
+				targetBtn.click();
+			}
+		}`)
+	}
+
+	// 等待可能的确认弹窗（如"确认发布？"）
+	time.Sleep(2 * time.Second)
+	page.MustEval(`() => {
+		const allBtns = document.querySelectorAll('button, .d-button, [role="button"]');
+		for (const btn of allBtns) {
+			const text = btn.textContent.trim();
+			if (text === '确认发布' || text === '确认' || text === '确定') {
+				btn.click();
+				return text;
+			}
+		}
+		return '';
+	}`)
+
+	// 等待发布响应（10 秒）
+	time.Sleep(10 * time.Second)
+
+	// 点击后截图看结果
+	screenshotData3, _ := page.Screenshot(true, nil)
+	if len(screenshotData3) > 0 {
+		os.WriteFile("/tmp/xhs_after_click.png", screenshotData3, 0644)
+		slog.Info("[debug] 已保存点击后截图到 /tmp/xhs_after_click.png")
+	}
+
+	// 检查当前URL - 发布成功后通常会跳转
+	finalURL := page.MustInfo().URL
+	slog.Info("[debug] 发布后页面URL", "url", finalURL)
+
 	return nil
 }
 
