@@ -616,11 +616,19 @@ func submitPublish(page *rod.Page, title, content string, tags []string, schedul
 		slog.Info("[debug] 已保存点击后截图到 /tmp/xhs_after_click.png")
 	}
 
-	// 检查当前URL - 发布成功后通常会跳转
+	// 检查当前URL - 发布成功后通常会跳转到 published=true
 	finalURL := page.MustInfo().URL
 	slog.Info("[debug] 发布后页面URL", "url", finalURL)
 
-	return nil
+	// 检查是否真正发布成功
+	if strings.Contains(finalURL, "published=true") {
+		slog.Info("[debug] ✅ 发布成功确认: URL 包含 published=true")
+		return nil
+	}
+
+	// URL 不包含 published=true，说明发布未成功
+	slog.Warn("[debug] ❌ 发布失败: URL 未包含 published=true", "url", finalURL)
+	return errors.Errorf("发布未成功: 页面URL未跳转到published=true (当前URL: %s)", finalURL)
 }
 
 // 检查标题是否超过最大长度
