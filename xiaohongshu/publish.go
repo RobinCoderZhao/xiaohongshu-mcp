@@ -331,67 +331,16 @@ func waitForUploadComplete(page *rod.Page, expectedCount int) error {
 		time.Sleep(checkInterval)
 	}
 
-	// Phase 2: 等待图片真正上传完成（进度条消失、loading 动画结束）
-	// 海外服务器上传 2MB+ 图片到国内可能需要 10-60 秒
-	slog.Info("等待图片真正上传完成（检查进度和 loading 状态）...")
-	uploadStart := time.Now()
-	uploadTimeout := 90 * time.Second
+	// Phase 2: 图片预览已出现，等待上传完成
+	// 注意: 之前的 JS DOM 检测（进度条、loading 类名、blob URL）实际上不匹配小红书的 DOM 结构，
+	// 导致永远返回 false，白等 90 秒。
+	// 最终发布是否成功由 submitPublish 中的 published=true URL 检查来保障，
+	// 这里只需等待一个合理的固定时间让图片上传到 CDN 即可。
+	fixedWait := 30 * time.Second
+	slog.Info("图片预览已出现，等待上传完成...", "wait_seconds", int(fixedWait.Seconds()))
+	time.Sleep(fixedWait)
+	slog.Info("图片上传等待完成")
 
-	for time.Since(uploadStart) < uploadTimeout {
-		// 检查是否还有上传进度条、loading 动画或未完成的上传
-		uploadDone := page.MustEval(`() => {
-			// 检查是否有进度条
-			const progressBars = document.querySelectorAll('.progress, .upload-progress, [class*="progress"], .loading, [class*="loading"]');
-			for (const pb of progressBars) {
-				const rect = pb.getBoundingClientRect();
-				if (rect.width > 0 && rect.height > 0) {
-					return false; // 还有可见的进度条
-				}
-			}
-			// 检查图片预览元素是否有 loading 类
-			const previews = document.querySelectorAll('.img-preview-area .pr');
-			for (const p of previews) {
-				if (p.classList.contains('loading') || p.classList.contains('uploading')) {
-					return false; // 还在上传中
-				}
-				// 检查图片 src 是否为 blob URL（上传中的本地预览） vs CDN URL（上传完成）
-				const img = p.querySelector('img');
-				if (img) {
-					const src = img.src || img.getAttribute('src') || '';
-					// blob: 或空 src 表示还在上传
-					if (src.startsWith('blob:') || src === '') {
-						return false;
-					}
-				}
-			}
-			// 检查是否有"上传中"文字
-			const uploading = document.querySelector('[class*="uploading"], .upload-status');
-			if (uploading && uploading.textContent.includes('上传')) {
-				return false;
-			}
-			return true;
-		}`).Bool()
-
-		elapsed := time.Since(uploadStart).Seconds()
-
-		if uploadDone {
-			slog.Info("图片上传完成", "elapsed_seconds", int(elapsed))
-			// 即使检测到完成，也额外等一会确保服务器端处理完毕
-			extraWait := 5 * time.Second
-			slog.Info("额外等待确保上传处理完毕", "extra_wait", extraWait)
-			time.Sleep(extraWait)
-			return nil
-		}
-
-		if int(elapsed)%10 == 0 && int(elapsed) > 0 {
-			slog.Info("图片仍在上传中...", "elapsed_seconds", int(elapsed))
-		}
-		time.Sleep(checkInterval)
-	}
-
-	// 超时了但仍然继续（可能检测逻辑不完美，但图片实际已上传）
-	slog.Warn("图片上传等待超时(90s)，但继续执行发布", "elapsed", time.Since(uploadStart))
-	time.Sleep(5 * time.Second) // 额外等 5 秒再继续
 	return nil
 }
 
